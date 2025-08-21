@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <title>RSI Backtest — Live + Divergences (BTC/ETH/SOL/DOGE/XRP)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root { --maxw: 1160px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:20px; }
+    h1 { margin: 0 0 10px; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; margin:6px 0; align-items:center; }
+    label { font-size:0.9rem; }
+    input, select, button { padding:.35rem .5rem; }
+    button { cursor: pointer; }
+    canvas { border:1px solid #ccc; margin:10px 8px 18px 8px; width:100%; max-width:1140px; }
+    .panel { border:1px solid #ddd; border-radius:10px; padding:10px; max-width:var(--maxw); }
+    #recap { font-size:0.95rem; line-height:1.4; }
+    .pill { display:inline-block; padding:2px 6px; border-radius:6px; background:#f6f6f6; margin:3px; }
+    #status { color:#666; margin-left: 6px; }
+    #tip {
+      position: fixed; pointer-events:none; z-index:10;
+      background: rgba(30,30,30,.9); color:#fff; font:12px/1.35 system-ui;
+      padding:8px 10px; border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,.2);
+      white-space:nowrap; display:none;
+    }
+    #log { max-width:var(--maxw); overflow:auto; background:#fafafa; padding:8px; border:1px solid #eee; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <h1>RSI Backtest — Prix, RSI, Équity (+ Investi) + Divergences + Live</h1>
+
+  <div class="panel">
+    <div class="row">
+      <label>Symbole
+        <select id="symbolPreset">
+          <option value="BTCUSDT">BTCUSDT (Bitcoin)</option>
+          <option value="ETHUSDT">ETHUSDT (Ethereum)</option>
+          <option value="SOLUSDT">SOLANUSDT (Solana)*</option>
+          <option value="DOGEUSDT">DOGEUSDT (Dogecoin)</option>
+          <option value="XRPUSDT">XRPUSDT (XRP)</option>
+          <option value="custom">⟶ Saisir ci-dessous…</option>
+        </select>
+      </label>
+      <input id="symbol" value="BTCUSDT" style="min-width:140px"/>
+      <label>Début <input id="start" type="date" value="2017-01-01"></label>
+      <label>Fin <input id="end" type="date"></label>
+      <label>Période RSI <input id="period" type="number" value="14" min="2"></label>
+      <label>Bas min <input id="lowMin" type="number" value="30"></label>
+      <label>Bas max <input id="lowMax" type="number" value="40"></label>
+      <label>Haut min <input id="highMin" type="number" value="60"></label>
+      <label>Haut max <input id="highMax" type="number" value="80"></label>
+      <label>Pas <input id="step" type="number" value="2"></label>
+      <label>Frais (bps) <input id="fees" type="number" value="4"></label>
+      <label>Stratégie
+        <select id="strategy">
+          <option value="simple">RSI simple</option>
+          <option value="extended_total">RSI pyramiding (NO-LOSS, vente totale)</option>
+          <option value="extended_partial">RSI pyramiding (ventes partielles)</option>
+        </select>
+      </label>
+      <button id="runBtn">Charger & Optimiser</button>
+      <button id="resetBtn">Réinitialiser le zoom</button>
+      <span id="status"></span>
+    </div>
+    <div class="row">
+      <label>Fenêtre divergences (win) <input id="divWin" type="number" value="2" min="1" max="10" style="width:60px"></label>
+      <label><input id="divConfirm" type="checkbox"> Confirmer extrêmes</label>
+      <label><input id="liveToggle" type="checkbox"> Suivi en direct</label>
+      <label>Rafraîchissement
+        <select id="liveFreq">
+          <option value="5000">5 s</option>
+          <option value="10000" selected>10 s</option>
+          <option value="30000">30 s</option>
+          <option value="60000">60 s</option>
+        </select>
+      </label>
+      <span id="liveNow" class="pill" style="display:none;"></span>
+    </div>
+  </div>
+
+  <canvas id="priceCanvas" width="1140" height="320"></canvas>
+  <canvas id="rsiCanvas"    width="1140" height="180"></canvas>
+  <canvas id="equityCanvas" width="1140" height="260"></canvas>
+
+  <div class="panel" id="recap"></div>
+  <pre id="log"></pre>
+  <div id="tip"></div>
+
+  <script type="module">
+    import { rsiSeries, optimizeRSI } from './strategy.js';
+    import { detectDivergences } from './divergence.js';
+    import { LiveMonitor } from './live.js';
+
+    const $=id=>document.getElementById(id);
+    const ctxP=$('priceCanvas').getContext('2d');
+    const ctxR=$('rsiCanvas').getContext('2d');
+    const ctxE=$('equityCanvas').getContext('2d');
+    const tip=$('tip');
+    const today=new Date().toISOString().slice(0,10);
+    if(!$('end').value) $('end').value=today;
+
+    $('symbolPreset').addEventListener('change', (e)=>{
+      const v=e.target.value;
+      if(v!=='custom') $('symbol').value=v;
+      $('runBtn').click();
+    });
+
+    function setStatus(s){$('status').textContent=s;}
+    function log(m){$('log').textContent=(typeof m==='string'?m:JSON.stringify(m,null,2));}
+
+    const state={ times:[], closes:[], rsi:[], sig:[], bt:null, iStart:0, iEnd:0, hadView:false, hoverIdx:null, divBear:[], divBull:[] };
+    const PADS = { L:110, R:130, T:12, B:28 };
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const fmtPct=(v)=> (Number.isFinite(v)? v.toLocaleString('fr-FR',{maximumFractionDigits:2})+' %':'');
+    const fmtNum=(v,dec=2)=> Number(v).toLocaleString('fr-FR',{maximumFractionDigits:dec});
+
+    // === Axes / utilitaires de tracé
+    function drawAxesLeftRight(ctx,W,H,yMinL,yMaxL,yFmtL,times, iStart, iEnd, yMinR=null, yMaxR=null, yFmtR=null){
+      const {L,R,T,B}=PADS;
+      ctx.clearRect(0,0,W,H);
+      ctx.strokeStyle='#ddd'; ctx.lineWidth=1; ctx.strokeRect(L,T,W-L-R,H-T-B);
+      ctx.font='11px system-ui'; ctx.fillStyle='#555'; ctx.textAlign='right'; ctx.textBaseline='middle';
+      for(let i=0;i<=6;i++){
+        const yy = T+(H-T-B)*i/6;
+        const val = yMaxL - (yMaxL - yMinL)*i/6;
+        ctx.strokeStyle='#f1f1f1'; ctx.beginPath(); ctx.moveTo(L,yy); ctx.lineTo(W-R,yy); ctx.stroke();
+        ctx.fillStyle='#555'; ctx.fillText(yFmtL(val), L-6, yy);
+      }
+      if(yMinR!=null && yMaxR!=null){
+        ctx.textAlign='left';
+        for(let i=0;i<=6;i++){
+          const yy = T+(H-T-B)*i/6;
+          const val = yMaxR - (yMaxR - yMinR)*i/6;
+          ctx.fillText(yFmtR(val), W-R+6, yy);
+        }
+      }
+      const span=Math.max(1, iEnd - iStart), ticks=8;
+      ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#555';
+      for(let k=0;k<=ticks;k++){
+        const idx = Math.round(iStart + span*k/ticks);
+        const x = L + (W-L-R)*( (idx-iStart)/span );
+        const d = new Date(times[idx]).toLocaleDateString('fr-FR', {year:'2-digit', month:'short'});
+        ctx.fillText(d, x, H-B+6);
+        ctx.strokeStyle='#f7f7f7'; ctx.beginPath(); ctx.moveTo(x,T); ctx.lineTo(x,H-B); ctx.stroke();
+      }
+    }
+    function xFromIndex(ctx, i){
+      const {L,R}=PADS; const W=ctx.canvas.width;
+      const span = Math.max(1, state.iEnd - state.iStart);
+      return L + (W-L-R) * ((i - state.iStart)/span);
+    }
+    function yFromVal(ctx, v, yMin, yMax){
+      const {T,B}=PADS; const H=ctx.canvas.height;
+      return T + (H-T-B) * (1 - (v - yMin)/(yMax - yMin || 1));
+    }
+    function drawSeries(ctx, data, color, yMin, yMax, iStart, iEnd, dash=null, width=1.4){
+      const {L,R,T,B}=PADS; const W=ctx.canvas.width, H=ctx.canvas.height;
+      ctx.strokeStyle=color; ctx.lineWidth=width; if(dash) ctx.setLineDash(dash);
+      ctx.beginPath(); let moved=false;
+      for(let i=iStart;i<=iEnd;i++){
+        const v=data[i]; if(!Number.isFinite(v)) continue;
+        const x = L + (W-L-R) * ((i-iStart)/Math.max(1,(iEnd-iStart)));
+        const y = T + (H-T-B) * (1 - (v - yMin) / (yMax - yMin || 1));
+        if(!moved){ ctx.moveTo(x,y); moved=true; } else { ctx.lineTo(x,y); }
+      }
+      ctx.stroke(); if(dash) ctx.setLineDash([]);
+    }
+    function drawMarkers(ctx, baseData, sig, yMin, yMax, iStart, iEnd){
+      const {L,R,T,B}=PADS;
+      for(let i=iStart;i<=iEnd;i++){
+        const tag=sig[i]; if(!tag) continue;
+        const v=baseData[i]; if(!Number.isFinite(v)) continue;
+        const x = xFromIndex(ctx,i);
+        const y = yFromVal(ctx, v, yMin, yMax);
+        ctx.fillStyle = tag==='BUY' ? '#0a0' : '#c00';
+        ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+      }
+    }
+
+    // === Interactions + tooltip
+    function idxFromCanvasX(canvas, xClient){
+      const {L,R}=PADS; const W=canvas.width;
+      const x = xClient - canvas.getBoundingClientRect().left;
+      const ratio = clamp((x - L)/Math.max(1,(W - L - R)), 0, 1);
+      return Math.round(state.iStart + ratio * (state.iEnd - state.iStart));
+    }
+    function attachInteractions(canvas, redraw){
+      let dragging=false, dragX0=0;
+      canvas.addEventListener('wheel', (e)=>{
+        e.preventDefault(); if(!state.times.length) return;
+        const idx = idxFromCanvasX(canvas, e.clientX);
+        const span = state.iEnd - state.iStart;
+        const factor = (e.ctrlKey||e.metaKey) ? 0.85 : 0.9;
+        const zoom = (e.deltaY<0) ? factor : 1/factor;
+        const newSpan = Math.max(20, Math.round(span*zoom));
+        let s = Math.max(0, Math.min(state.times.length-2, idx - Math.round(newSpan*(idx - state.iStart)/span)));
+        let e2 = s + newSpan; if(e2>state.times.length-1){ e2=state.times.length-1; s=e2-newSpan; }
+        state.iStart=s; state.iEnd=e2; state.hadView=true; redraw();
+      }, {passive:false});
+      canvas.addEventListener('mousemove', (e)=>{
+        if(!state.times.length) return;
+        state.hoverIdx = idxFromCanvasX(canvas, e.clientX);
+        const i = Math.max(0, Math.min(state.times.length-1, state.hoverIdx));
+        const date = new Date(state.times[i]).toLocaleString('fr-FR', {year:'numeric', month:'short', day:'2-digit'});
+        const price = Number(state.closes[i]).toLocaleString('fr-FR',{maximumFractionDigits:6});
+        const rsi = Number(state.rsi[i]).toFixed(2);
+        const eq   = Number.isFinite(state.bt?.equity[i]) ? state.bt.equity[i] : null;
+        const eqPct= (eq!=null) ? (eq-1)*100 : null;
+        const inv  = state.bt?.investedSeries?.[i];
+        const contrib = state.bt?.contribSeries?.[i] ?? 0;
+        const netMult = (eq!=null && contrib>0) ? (eq/contrib) : null;
+        tip.innerHTML = `
+          <b>${date}</b><br/>
+          Prix&nbsp;: ${price}<br/>
+          RSI&nbsp;: ${rsi} %<br/>
+          Équity&nbsp;: ${eqPct!=null ? eqPct.toFixed(2)+' %' : '—'}<br/>
+          Investi (u)&nbsp;: ${Number.isFinite(inv)? inv.toFixed(2) : '—'}<br/>
+          Perf nette&nbsp;: ${netMult!=null ? ( ((netMult-1)*100).toFixed(2)+' %  |  ×'+netMult.toFixed(3) ) : '—'}
+        `;
+        tip.style.display='block';
+        const pad=14;
+        tip.style.left = (e.clientX + pad) + 'px';
+        tip.style.top  = (e.clientY + pad) + 'px';
+        redraw();
+      });
+      canvas.addEventListener('mouseleave', ()=>{ state.hoverIdx=null; tip.style.display='none'; redraw(); });
+      canvas.addEventListener('mousedown', (e)=>{ dragging=true; dragX0 = idxFromCanvasX(canvas, e.clientX); });
+      window.addEventListener('mousemove', (e)=>{
+        if(!dragging) return;
+        const idx = idxFromCanvasX(canvas, e.clientX);
+        const delta = dragX0 - idx; dragX0 = idx;
+        const span = state.iEnd - state.iStart;
+        let s = Math.max(0, Math.min(state.times.length-2, state.iStart + delta));
+        let e2 = s + span; if(e2>state.times.length-1){ e2=state.times.length-1; s=e2-span; }
+        state.iStart=s; state.iEnd=e2; state.hadView=true; redraw();
+      });
+      window.addEventListener('mouseup', ()=>{ dragging=false; redraw(); });
+      canvas.addEventListener('dblclick', ()=>{ state.iStart=0; state.iEnd=Math.max(1,state.times.length-1); state.hadView=false; redraw(); });
+    }
+    function drawHoverLine(ctx){
+      if(state.hoverIdx==null) return;
+      const x = xFromIndex(ctx, state.hoverIdx);
+      const {T,B}=PADS;
+      ctx.save(); ctx.strokeStyle='rgba(80,120,200,.7)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, ctx.canvas.height-B); ctx.stroke(); ctx.restore();
+    }
+
+    [ctxP,ctxR,ctxE].forEach(c=>attachInteractions(c.canvas, (d)=>redraw(d)));
+    $('resetBtn').onclick = ()=>{ state.iStart=0; state.iEnd=Math.max(1,state.times.length-1); state.hadView=false; redraw(); };
+
+    // ======== fetch Binance (1d paginé)
+    async function fetchDailyPaginated(symbol,startMs,endMs){
+      const out=[]; let cursor=startMs; const limit=1000;
+      while(true){
+        const u=new URL('https://api.binance.com/api/v3/klines');
+        u.searchParams.set('symbol',symbol);
+        u.searchParams.set('interval','1d');
+        u.searchParams.set('limit',String(limit));
+        u.searchParams.set('startTime',String(cursor));
+        u.searchParams.set('endTime',String(endMs));
+        const res=await fetch(u.toString());
+        if(!res.ok){ const txt=await res.text().catch(()=>res.statusText); throw new Error(`Binance ${res.status} — ${txt}`); }
+        const arr=await res.json(); if(!arr.length) break;
+        for(const k of arr){ out.push({t:+k[0], c:+k[4]}); }
+        const next=arr.at(-1)[6]+1; if(next>endMs || next<=cursor) break;
+        cursor=next; await new Promise(r=>setTimeout(r,40));
+      }
+      return out;
+    }
+
+    function redraw(){
+      if(!state.times.length) return;
+      const iS=state.iStart, iE=state.iEnd;
+
+      // ======== PRIX
+      { const W=ctxP.canvas.width, H=ctxP.canvas.height;
+        const sl=state.closes.slice(iS,iE+1).filter(Number.isFinite);
+        const min=Math.min(...sl), max=Math.max(...sl);
+        drawAxesLeftRight(ctxP, W,H, min,max, v=>Number(v).toLocaleString('fr-FR',{maximumFractionDigits:6}), state.times, iS,iE);
+        drawSeries(ctxP, state.closes, '#111', min,max, iS,iE);
+        drawMarkers(ctxP, state.closes, state.sig, min,max, iS,iE);
+        // Divergences sur PRIX : ▼ rouge (bear), ▲ vert (bull)
+        ctxP.font='14px system-ui'; ctxP.textAlign='center'; ctxP.textBaseline='middle';
+        for(const i of state.divBear||[]){
+          if(i<iS||i>iE) continue;
+          const x=xFromIndex(ctxP,i), y=yFromVal(ctxP, state.closes[i], min, max);
+          ctxP.fillStyle='#c00'; ctxP.fillText('▼', x, y-10);
+        }
+        for(const i of state.divBull||[]){
+          if(i<iS||i>iE) continue;
+          const x=xFromIndex(ctxP,i), y=yFromVal(ctxP, state.closes[i], min, max);
+          ctxP.fillStyle='#0a0'; ctxP.fillText('▲', x, y+12);
+        }
+        drawHoverLine(ctxP);
+      }
+
+      // ======== RSI
+      { const W=ctxR.canvas.width, H=ctxR.canvas.height, min=0, max=100;
+        drawAxesLeftRight(ctxR, W,H, min,max, v=>Math.round(v)+' %', state.times, iS,iE);
+        // bandes 30/70
+        ctxR.strokeStyle='#e8e8e8';
+        const yPos = (val)=> yFromVal(ctxR,val,min,max);
+        ctxR.beginPath(); ctxR.moveTo(PADS.L, yPos(30)); ctxR.lineTo(W-PADS.R, yPos(30));
+        ctxR.moveTo(PADS.L, yPos(70)); ctxR.lineTo(W-PADS.R, yPos(70)); ctxR.stroke();
+        drawSeries(ctxR, state.rsi, '#1565c0', min,max, iS,iE);
+        drawMarkers(ctxR, state.rsi, state.sig, min,max, iS,iE);
+        // Points RSI aux divergences
+        for(const i of state.divBear||[]){
+          if(i<iS||i>iE) continue;
+          const x=xFromIndex(ctxR,i), y=yFromVal(ctxR, state.rsi[i], min, max);
+          ctxR.fillStyle='#c00'; ctxR.beginPath(); ctxR.arc(x,y,3,0,2*Math.PI); ctxR.fill();
+        }
+        for(const i of state.divBull||[]){
+          if(i<iS||i>iE) continue;
+          const x=xFromIndex(ctxR,i), y=yFromVal(ctxR, state.rsi[i], min, max);
+          ctxR.fillStyle='#0a0'; ctxR.beginPath(); ctxR.arc(x,y,3,0,2*Math.PI); ctxR.fill();
+        }
+        drawHoverLine(ctxR);
+      }
+
+      // ======== ÉQUITY + INVESTI
+      { const W=ctxE.canvas.width, H=ctxE.canvas.height;
+        const eqPct = state.bt.equity.map(v => Number.isFinite(v)? (v-1)*100 : null);
+        const inv   = state.bt.investedSeries || state.closes.map(()=>0);
+        const sliceEq = eqPct.slice(iS,iE+1).filter(Number.isFinite);
+        const eqMin = sliceEq.length? Math.min(...sliceEq) : -10;
+        const eqMax = sliceEq.length? Math.max(...sliceEq) : 10;
+        const sliceInv = inv.slice(iS,iE+1).filter(Number.isFinite);
+        const invMin = 0, invMax = Math.max(1, sliceInv.length? Math.max(...sliceInv):1);
+
+        drawAxesLeftRight(ctxE, W,H, eqMin,eqMax, v=>v.toLocaleString('fr-FR',{maximumFractionDigits:2})+' %', state.times, iS,iE, invMin, invMax, v=>v.toFixed(2)+' u');
+        drawSeries(ctxE, eqPct, '#2e7d32', eqMin,eqMax, iS,iE);
+        drawMarkers(ctxE, eqPct, state.sig, eqMin,eqMax, iS,iE);
+        drawSeries(ctxE, inv, '#6d4c41', invMin,invMax, iS,iE, [6,4], 1.2);
+        drawHoverLine(ctxE);
+      }
+    }
+
+    // ======== Benchmarks
+    function benchBuyAndHold1U(prices){
+      if(!prices.length) return { multiple:1, pct:0 };
+      const mult = prices.at(-1)/prices[0];
+      return { multiple: mult, pct: (mult-1)*100 };
+    }
+    function benchHoldOnSignals(prices, sig){
+      if(!prices.length) return { multiple:1, pct:0, contrib:0, netMultiple:1, netPct:0 };
+      const p0 = prices[0];
+      let units = 0;
+      let contrib = 0;
+      units += 1/p0; contrib += 1; // 1U initial
+      for(let i=0;i<sig.length;i++){
+        if(sig[i]==='BUY'){ units += 1/prices[i]; contrib += 1; }
+      }
+      const finalValue = units * prices.at(-1);
+      const multiple = finalValue;
+      const pct = (multiple - 1) * 100;
+      const netMultiple = contrib>0 ? (finalValue / contrib) : 1;
+      const netPct = (netMultiple - 1) * 100;
+      return { multiple, pct, contrib, netMultiple, netPct };
+    }
+
+    let lastOptimizeResult = null;
+
+    async function run(){
+      try{
+        setStatus('Chargement…'); log('');
+        const start=new Date(($('start').value||'2017-01-01')).getTime();
+        const end=new Date(($('end').value||today)).getTime()+86_400_000-1;
+        const sym=($('symbol').value||'BTCUSDT').trim().toUpperCase();
+        const bars=await fetchDailyPaginated(sym,start,end);
+        if(!bars.length) throw new Error('Aucune donnée (symbole/dates).');
+
+        state.times = bars.map(b=>b.t);
+        state.closes= bars.map(b=>b.c);
+        state.rsi   = rsiSeries(state.closes, +$('period').value||14);
+        if(!state.hadView){ state.iStart=0; state.iEnd=state.times.length-1; }
+
+        const opts={ lowMin:+$('lowMin').value, lowMax:+$('lowMax').value,
+          highMin:+$('highMin').value, highMax:+$('highMax').value,
+          step:Math.max(1,+$('step').value|0),
+          feesBps:Math.max(0,+$('fees').value||0),
+          buyMode:'up', sellMode:'down',
+          period:+$('period').value||14,
+          strategy:$('strategy').value };
+
+        const res=optimizeRSI(state.closes, state.rsi, opts);
+        if(!res.best) throw new Error('Pas de combinaison valide.');
+        lastOptimizeResult = res;
+        state.sig = res.best.sig;
+        state.bt  = res.best.bt;
+
+        // Divergences (visuel)
+        const divOpts = { win: Math.max(1, +$('divWin').value||2), confirm: $('divConfirm').checked };
+        const divs = detectDivergences(state.closes, state.rsi, divOpts);
+        state.divBear = divs.bears;
+        state.divBull = divs.bulls;
+
+        // Benchmarks
+        const hold1 = benchBuyAndHold1U(state.closes);
+        const holdDca = benchHoldOnSignals(state.closes, state.sig);
+
+        // Perf brute et nette de la stratégie
+        const perfPct = state.bt.totalReturn*100;
+        const multiple = 1 + state.bt.totalReturn;
+        const netPct = (state.bt.netReturn??0)*100;
+        const netMult = 1 + (state.bt.netReturn??0);
+
+        const closed = state.bt.trades.filter(t=>t.type==='SELL' || t.type==='SELL_PART');
+        const buys   = state.bt.trades.filter(t=>t.type==='BUY' || t.type==='BUY+').length;
+
+        $('recap').innerHTML = `
+          <div class="pill"><b>Symbole</b> ${sym}</div>
+          <div class="pill"><b>Période RSI</b> ${res.periodUsed}</div>
+          <div class="pill"><b>Stratégie</b> ${$('strategy').value}</div>
+          <div class="pill"><b>Seuils</b> Bas=${res.best.low} / Haut=${res.best.high}</div>
+
+          <div class="pill"><b>Perf brute</b> ${fmtNum(perfPct,2)}% &nbsp;|&nbsp; <b>×</b>${fmtNum(multiple,3)}</div>
+          <div class="pill"><b>Perf nette vs capital</b> ${fmtNum(netPct,2)}% &nbsp;|&nbsp; <b>×</b>${fmtNum(netMult,3)}</div>
+
+          <div class="pill"><b>Buy&Hold 1U</b> ${fmtNum(hold1.pct,2)}% &nbsp;|&nbsp; <b>×</b>${fmtNum(hold1.multiple,3)}</div>
+
+          <div class="pill"><b>Hold sur signaux</b> net ${fmtNum(holdDca.netPct,2)}% &nbsp;|&nbsp; <b>×</b>${fmtNum(holdDca.netMultiple,3)}</div>
+          <div class="pill"><b>Hold sur signaux</b> brut ${fmtNum(holdDca.pct,2)}% &nbsp;|&nbsp; <b>×</b>${fmtNum(holdDca.multiple,3)}</div>
+          <div class="pill"><b>Capital apporté (hold signaux)</b> ${fmtNum(holdDca.contrib,2)} u</div>
+
+          <div class="pill"><b>Divergences</b> Bearish: ${state.divBear.length} • Bullish: ${state.divBull.length}</div>
+
+          <div class="pill"><b>Drawdown</b> ${fmtNum(state.bt.maxDD*100,2)}%</div>
+          <div class="pill"><b>Investi moyen</b> ${fmtNum(state.bt.avgInvested??0,2)}</div>
+          <div class="pill"><b>Investi max</b> ${fmtNum(state.bt.maxInvested??0,2)}</div>
+          <div class="pill"><b>Stake courant</b> ${fmtNum(state.bt.lastStake??1,2)}</div>
+          <div class="pill"><b>BUY</b> ${buys} / <b>Ventes</b> ${closed.length}</div>
+        `;
+
+        setStatus('OK'); redraw();
+      }catch(e){
+        console.error(e); setStatus('Erreur'); log(e.message||String(e));
+      }
+    }
+
+    // === Live monitor
+    const liveNow = $('liveNow');
+    function getLiveState(){
+      const best = lastOptimizeResult?.best ?? { low:+$('lowMin').value, high:+$('highMax').value };
+      return {
+        times: state.times, closes: state.closes, rsi: state.rsi,
+        period: +$('period').value || 14,
+        best,
+        buyMode: 'up', sellMode: 'down'
+      };
+    }
+    function getLiveParams(){ return { symbol: ($('symbol').value||'BTCUSDT').trim().toUpperCase() }; }
+
+    const live = new LiveMonitor({
+      getState: getLiveState,
+      getParams: getLiveParams,
+      onUpdate: ({time, price, rsi, action, low, high})=>{
+        liveNow.style.display = 'inline-block';
+        const d = new Date(time).toLocaleString('fr-FR', {hour:'2-digit', minute:'2-digit'});
+        const aTxt = action==='BUY' ? 'ACHAT' : action==='SELL' ? 'VENTE' : 'HOLD';
+        liveNow.textContent = `Live ${d} — ${aTxt} | Prix ${price.toLocaleString('fr-FR')} | RSI ${rsi?.toFixed(2)} (bas=${low}, haut=${high})`;
+      },
+      onStatus: (txt)=>{ if(txt) setStatus(txt); }
+    });
+
+    $('liveToggle').addEventListener('change', (e)=>{
+      if(e.target.checked){
+        live.setThrottle(+$('liveFreq').value);
+        live.start();
+      } else {
+        live.stop(); liveNow.style.display='none';
+      }
+    });
+    $('liveFreq').addEventListener('change', ()=> live.setThrottle(+$('liveFreq').value));
+
+    // Attache interactions + run
+    [ctxP,ctxR,ctxE].forEach(c=>attachInteractions(c.canvas, ()=>redraw()));
+    $('resetBtn').onclick = ()=>{ state.iStart=0; state.iEnd=Math.max(1,state.times.length-1); state.hadView=false; redraw(); };
+    $('runBtn').onclick = run;
+    run();
+  </script>
+</body>
+</html>
